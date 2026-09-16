@@ -204,10 +204,13 @@ export interface DownloadSegmentSkeletonOptions {
 }
 
 /**
- * Per-source-chunk bookkeeping kept while {@link downloadSegmentSkeleton}
- * processes a manifest.  Used after concatenation to translate
- * cross-chunk endpoint references into the merged-output vertex index
- * space.
+ * Per-block bookkeeping kept while {@link downloadSegmentSkeleton}
+ * processes a manifest.  Used to build {@link OrderedManifestBlock}s for
+ * the `implicit_sequential` cross-chunk path, which needs one entry PER
+ * BLOCK (a chunk visited more than once yields more than one).  The
+ * skeleton cross-chunk path uses `chunkVertexGlobal` instead (accumulated
+ * per CHUNK, across every block that touches it) — see its own doc
+ * comment for why a per-block map like this one can't serve that path.
  */
 interface OwnedChunkInfo {
   /** Map from chunk-local vertex index → filtered-output position (-1 = dropped). */
@@ -216,14 +219,6 @@ interface OwnedChunkInfo {
   readonly vertexOffset: number;
 }
 
-/**
- * Pure helper: given a decoded cross-chunk table and the per-chunk
- * remap/offset info collected during fragment aggregation, emit the
- * subset of edges whose endpoints both land on owned vertices.
- *
- * Exported so unit tests can drive it with hand-crafted fixtures
- * without staging a whole manifest/chunk pipeline.
- */
 /**
  * Per-block bookkeeping carried by {@link downloadSegmentSkeleton}'s
  * manifest walk.  Exposed via the helper signatures so unit tests can
@@ -287,9 +282,33 @@ export function deriveImplicitSequentialCrossChunkEdges(
   return new Uint32Array(out);
 }
 
+/**
+ * Pure helper: given a decoded cross-chunk table and each touched
+ * chunk's chunk-local-vertex → merged-output-index map, emit the subset
+ * of edges whose endpoints both land on owned vertices.
+ *
+ * Takes `chunkVertexGlobal` (accumulated per CHUNK, across every
+ * manifest block that touches it), NOT the per-BLOCK `OwnedChunkInfo`
+ * map. A chunk hosting more than one of this object's fragments (an
+ * ordinary occurrence -- a branch that revisits a chunk, or simply two
+ * separate fragments sharing a chunk) produces more than one block for
+ * that chunk key; a per-block map can only remember the last one
+ * written, silently losing any cross-chunk edge whose endpoint falls in
+ * an earlier block. `chunkVertexGlobal` has no such gap: it is one
+ * array per chunk, written into (never replaced) as each block touching
+ * that chunk is processed, so every fragment's vertices resolve
+ * correctly regardless of how many blocks the chunk was split into.
+ * Confirmed against a real 158-vertex neuron with four multi-fragment
+ * chunks: the per-block map recovered only 1 of 8 real cross-chunk
+ * edges (the one whose endpoints happened to both land in each chunk's
+ * LAST block); every other real edge was silently dropped.
+ *
+ * Exported so unit tests can drive it with hand-crafted fixtures
+ * without staging a whole manifest/chunk pipeline.
+ */
 export function collectOwnedCrossChunkEdges(
   table: CrossChunkLinksTable,
-  ownedChunks: Map<string, OwnedChunkInfo>,
+  chunkVertexGlobal: Map<string, Int32Array>,
 ): Uint32Array {
   // Only line-arity (linkWidth=2) records describe cross-chunk edges.
   // Triangle / metanode records aren't relevant to streamline rendering.
@@ -297,20 +316,16 @@ export function collectOwnedCrossChunkEdges(
   const out: number[] = [];
   for (const record of table.records) {
     const [a, b] = record.endpoints;
-    const aKey = a.chunkCoords.join(".");
-    const bKey = b.chunkCoords.join(".");
-    const aInfo = ownedChunks.get(aKey);
-    const bInfo = ownedChunks.get(bKey);
-    if (aInfo === undefined || bInfo === undefined) continue;
-    if (a.vertexIndex < 0 || a.vertexIndex >= aInfo.vertexRemap.length)
-      continue;
-    if (b.vertexIndex < 0 || b.vertexIndex >= bInfo.vertexRemap.length)
-      continue;
-    const aRemap = aInfo.vertexRemap[a.vertexIndex];
-    const bRemap = bInfo.vertexRemap[b.vertexIndex];
-    if (aRemap < 0 || bRemap < 0) continue;
-    out.push(aRemap + aInfo.vertexOffset);
-    out.push(bRemap + bInfo.vertexOffset);
+    const aGlobalOf = chunkVertexGlobal.get(a.chunkCoords.join("."));
+    const bGlobalOf = chunkVertexGlobal.get(b.chunkCoords.join("."));
+    if (aGlobalOf === undefined || bGlobalOf === undefined) continue;
+    if (a.vertexIndex < 0 || a.vertexIndex >= aGlobalOf.length) continue;
+    if (b.vertexIndex < 0 || b.vertexIndex >= bGlobalOf.length) continue;
+    const aGlobal = aGlobalOf[a.vertexIndex];
+    const bGlobal = bGlobalOf[b.vertexIndex];
+    if (aGlobal < 0 || bGlobal < 0) continue;
+    out.push(aGlobal);
+    out.push(bGlobal);
   }
   return new Uint32Array(out);
 }
@@ -366,11 +381,6 @@ export async function downloadSegmentSkeleton(
     { length: numAttrsExpected },
     () => [] as AttributeTypedArray[],
   );
-  // Per-source-chunk remap/offset, indexed by chunk key.  Populated as
-  // we walk the manifest; consumed below by the blob-based cross-chunk
-  // path (graphs / skeletons with explicit links).  Keyed by chunk so
-  // an arbitrary cross-chunk record can find the relevant remap.
-  const ownedChunks = new Map<string, OwnedChunkInfo>();
   // Per-block bookkeeping, in manifest order.  Drives the
   // implicit_sequential cross-chunk path: consecutive blocks in
   // different chunks emit one bridging edge (last vertex of fragment k →
@@ -439,9 +449,12 @@ export async function downloadSegmentSkeleton(
   );
   if (signal.aborted) return undefined;
 
-  // Chunk-local vertex -> merged-output index, accumulated across every block
-  // of that chunk. `ownedChunks` cannot serve this: it is last-write-wins per
-  // chunk, so it forgets all but the final block's remap.
+  // Chunk-local vertex -> merged-output index, accumulated across every
+  // block of that chunk (a per-block map can only remember the last
+  // block written for a given chunk key, silently losing any earlier
+  // fragment's vertices -- see collectOwnedCrossChunkEdges's doc
+  // comment). Drives both the intra-chunk branch-link lookup below and
+  // the skeleton cross-chunk edge path further down.
   const chunkVertexGlobal = new Map<string, Int32Array>();
 
   for (const block of manifest) {
@@ -471,11 +484,11 @@ export async function downloadSegmentSkeleton(
       vertexRemap: filtered.vertexRemap,
       vertexOffset: runningVertexOffset,
     };
-    // Last-write-wins if a chunk shows up multiple times in the
-    // manifest.  The blob-based cross-chunk path can't disambiguate
-    // either way; the manifest-driven path uses `orderedBlocks` (which
-    // does preserve all visits).
-    ownedChunks.set(chunkKey, info);
+    // `orderedBlocks` intentionally keeps one entry PER BLOCK (a chunk
+    // visited more than once yields more than one) -- the
+    // implicit_sequential path needs each visit's own identity. The
+    // skeleton cross-chunk path instead accumulates into
+    // `chunkVertexGlobal` below, per CHUNK rather than per block.
     orderedBlocks.push({
       ...info,
       chunkKey,
@@ -575,13 +588,16 @@ export async function downloadSegmentSkeleton(
   //  - explicit / implicit_sequential_with_branches (graphs, skeletons):
   //    the on-disk cross_chunk_links blob carries real chunk-local
   //    vertex indices for each endpoint.  Use the blob-based filter on
-  //    `ownedChunks`.
+  //    `chunkVertexGlobal`.
   let crossChunkEdges: Uint32Array | undefined;
   if (linksConvention === "implicit_sequential") {
     const edges = deriveImplicitSequentialCrossChunkEdges(orderedBlocks);
     if (edges.length > 0) crossChunkEdges = edges;
-  } else if (crossChunkLinks !== undefined && ownedChunks.size > 0) {
-    const edges = collectOwnedCrossChunkEdges(crossChunkLinks, ownedChunks);
+  } else if (crossChunkLinks !== undefined && chunkVertexGlobal.size > 0) {
+    const edges = collectOwnedCrossChunkEdges(
+      crossChunkLinks,
+      chunkVertexGlobal,
+    );
     if (edges.length > 0) crossChunkEdges = edges;
   }
 

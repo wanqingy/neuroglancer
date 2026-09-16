@@ -651,11 +651,11 @@ describe("collectOwnedCrossChunkEdges", () => {
     };
   }
 
-  function chunk(
-    remap: number[],
-    offset: number,
-  ): { vertexRemap: Int32Array; vertexOffset: number } {
-    return { vertexRemap: Int32Array.from(remap), vertexOffset: offset };
+  /** One chunk's chunk-local-vertex -> merged-output-index array, already
+   * offset-applied -- the `chunkVertexGlobal` shape, not the old
+   * per-block `OwnedChunkInfo` (remap + separate offset). */
+  function chunkGlobal(globalIndices: number[]): Int32Array {
+    return Int32Array.from(globalIndices);
   }
 
   it("emits one edge per fully-owned record", () => {
@@ -667,10 +667,10 @@ describe("collectOwnedCrossChunkEdges", () => {
       ],
     ]);
     const owned = new Map([
-      // Chunk 0.0.0 has 3 vertices; vert 2 → merged index 2; offset 0.
-      ["0.0.0", chunk([0, 1, 2], 0)],
-      // Chunk 1.0.0 has 4 vertices; vert 0 → merged index 0; offset 3.
-      ["1.0.0", chunk([0, 1, 2, 3], 3)],
+      // Chunk 0.0.0 has 3 vertices; vert 2 → merged index 2.
+      ["0.0.0", chunkGlobal([0, 1, 2])],
+      // Chunk 1.0.0 has 4 vertices; vert 0 → merged index 3 (offset 3).
+      ["1.0.0", chunkGlobal([3, 4, 5, 6])],
     ]);
     const edges = collectOwnedCrossChunkEdges(t, owned);
     expect(Array.from(edges)).toEqual([2, 3]); // (0+2, 3+0)
@@ -683,7 +683,7 @@ describe("collectOwnedCrossChunkEdges", () => {
         { chunkCoords: [99, 0, 0], vertexIndex: 0 },
       ],
     ]);
-    const owned = new Map([["0.0.0", chunk([0], 0)]]);
+    const owned = new Map([["0.0.0", chunkGlobal([0])]]);
     expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([]);
   });
 
@@ -695,13 +695,13 @@ describe("collectOwnedCrossChunkEdges", () => {
       ],
     ]);
     const owned = new Map([
-      ["0.0.0", chunk([0, -1, 1], 0)], // vert 1 was filtered out
-      ["1.0.0", chunk([0, 1, 2], 2)],
+      ["0.0.0", chunkGlobal([0, -1, 1])], // vert 1 was filtered out
+      ["1.0.0", chunkGlobal([2, 3, 4])],
     ]);
     expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([]);
   });
 
-  it("translates merged indices using each chunk's stored vertex offset", () => {
+  it("translates merged indices using each chunk's already-offset global map", () => {
     const t = table(2, [
       [
         { chunkCoords: [0, 0, 0], vertexIndex: 0 },
@@ -709,8 +709,8 @@ describe("collectOwnedCrossChunkEdges", () => {
       ],
     ]);
     const owned = new Map([
-      ["0.0.0", chunk([5], 100)], // remap[0] = 5; offset 100 → merged 105
-      ["1.0.0", chunk([0, 1, 7], 200)], // remap[2] = 7; offset 200 → merged 207
+      ["0.0.0", chunkGlobal([105])], // vert 0 → merged 105
+      ["1.0.0", chunkGlobal([200, 201, 207])], // vert 2 → merged 207
     ]);
     expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([
       105, 207,
@@ -725,7 +725,7 @@ describe("collectOwnedCrossChunkEdges", () => {
         { chunkCoords: [0, 0, 0], vertexIndex: 2 },
       ],
     ]);
-    const owned = new Map([["0.0.0", chunk([0, 1, 2], 0)]]);
+    const owned = new Map([["0.0.0", chunkGlobal([0, 1, 2])]]);
     expect(collectOwnedCrossChunkEdges(t, owned).length).toBe(0);
   });
 
@@ -737,8 +737,8 @@ describe("collectOwnedCrossChunkEdges", () => {
       ],
     ]);
     const owned = new Map([
-      ["-1.-1.0", chunk([0], 0)],
-      ["0.-1.0", chunk([0], 1)],
+      ["-1.-1.0", chunkGlobal([0])],
+      ["0.-1.0", chunkGlobal([1])],
     ]);
     expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([0, 1]);
   });
@@ -751,8 +751,8 @@ describe("collectOwnedCrossChunkEdges", () => {
       ],
     ]);
     const owned = new Map([
-      ["0.0.0", chunk([0], 0)],
-      ["1.0.0", chunk([0], 1)],
+      ["0.0.0", chunkGlobal([0])],
+      ["1.0.0", chunkGlobal([1])],
     ]);
     expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([]);
   });
@@ -769,15 +769,53 @@ describe("collectOwnedCrossChunkEdges", () => {
       ],
     ]);
     const owned = new Map([
-      ["0.0.0", chunk([0], 0)],
-      ["1.0.0", chunk([0, 1], 1)],
-      ["2.0.0", chunk([0], 3)],
+      ["0.0.0", chunkGlobal([0])],
+      ["1.0.0", chunkGlobal([1, 2])],
+      ["2.0.0", chunkGlobal([3])],
     ]);
     expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([
       0,
       1, // record 0 → merged (0, 1)
       2,
       3, // record 1 → merged (2, 3)
+    ]);
+  });
+
+  it("recovers an edge whose endpoint sits in a chunk with MULTIPLE owned fragments -- the regression case", () => {
+    // The exact shape of the real bug: chunk 1.0.0 hosts two fragments of
+    // THIS object (chunk-local verts 0-1 are fragment A, merged into
+    // global 10-11; chunk-local verts 2-3 are fragment B, merged into
+    // global 20-21). A per-block `OwnedChunkInfo` map is last-write-wins,
+    // so whichever fragment was processed first would previously vanish
+    // entirely from cross-chunk resolution. `chunkVertexGlobal` instead
+    // holds ONE array per chunk with both fragments' vertices written in.
+    const t = table(2, [
+      // Touches fragment A's vertex (chunk-local 1) -- the one the old
+      // last-write-wins map would have lost if fragment B (chunk-local
+      // 2-3) was processed after it.
+      [
+        { chunkCoords: [1, 0, 0], vertexIndex: 1 },
+        { chunkCoords: [2, 0, 0], vertexIndex: 0 },
+      ],
+      // Touches fragment B's vertex (chunk-local 3) -- always worked,
+      // even with the old map, since it's whichever block wrote last.
+      [
+        { chunkCoords: [1, 0, 0], vertexIndex: 3 },
+        { chunkCoords: [3, 0, 0], vertexIndex: 0 },
+      ],
+    ]);
+    const owned = new Map([
+      // One array for the whole chunk: fragment A's local 0,1 map to
+      // global 10,11; fragment B's local 2,3 map to global 20,21.
+      ["1.0.0", chunkGlobal([10, 11, 20, 21])],
+      ["2.0.0", chunkGlobal([30])],
+      ["3.0.0", chunkGlobal([40])],
+    ]);
+    expect(Array.from(collectOwnedCrossChunkEdges(t, owned))).toEqual([
+      11,
+      30, // fragment A's crossing -- lost under the old per-block map
+      21,
+      40, // fragment B's crossing -- always worked
     ]);
   });
 });
