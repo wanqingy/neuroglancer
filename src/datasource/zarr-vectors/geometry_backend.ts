@@ -349,6 +349,67 @@ export class ZarrVectorsSpatialGeometrySourceBackend extends WithParameters(
    * full detail, and pass 1 holds only what the camera admitted, decimated to
    * the level in view.
    */
+  /**
+   * Whole-level cross-chunk links table for the node-inspection path, cached
+   * per source. `null` = absent, or a read that failed (see the catch).
+   */
+  private objectNodesCrossChunkLinks_: CrossChunkLinksTable | null | undefined;
+  private objectNodesLinksWarned_ = false;
+
+  /**
+   * The cross-chunk links table {@link getObjectSkeletonNodes} needs to
+   * reconnect one object across chunk boundaries.
+   *
+   * `implicit_sequential_with_branches` files every boundary-crossing edge in
+   * the links family, so WITHOUT this table an object spanning several chunks
+   * comes back as one disconnected component per chunk -- each crossing edge
+   * silently absent. That matters because the spatially-indexed overlay is what
+   * draws a SELECTED segment (pass 1 suppresses it from its browse pass), so
+   * the omission shows up as a gap at every chunk boundary, even though pass 1
+   * renders the same anatomy intact by stitching with ghost vertices.
+   *
+   * Reading the whole table is safe here: `explicit` -- the convention whose
+   * table is the multi-gigabyte whole-level decode -- is refused before this
+   * point, and the remaining conventions file one record per fragment
+   * adjacency, not one per edge.
+   */
+  private async getObjectNodesCrossChunkLinks(
+    signal: AbortSignal,
+  ): Promise<CrossChunkLinksTable | undefined> {
+    if (this.objectNodesCrossChunkLinks_ !== undefined) {
+      return this.objectNodesCrossChunkLinks_ ?? undefined;
+    }
+    const { baseUrl } = this.parameters;
+    try {
+      const table = await readCrossChunkLinks(
+        {
+          kvStoreRead: makeRawKvStoreRead(baseUrl, this.sharedKvStoreContext),
+          cellRead: this.cellRead,
+          kvStoreList: makeKvStoreList(baseUrl, this.sharedKvStoreContext),
+        },
+        signal,
+      );
+      this.objectNodesCrossChunkLinks_ = table ?? null;
+      return table;
+    } catch (e) {
+      // Degrade to the pre-fix behaviour (one component per chunk) rather than
+      // rejecting: `requestOverlaySegmentLoad` records a rejected segment in
+      // `failedOverlaySegmentLoads` and then draws NOTHING for it, which is
+      // strictly worse than drawing it with the boundary edges missing.
+      if (!this.objectNodesLinksWarned_) {
+        this.objectNodesLinksWarned_ = true;
+        console.warn(
+          "zarr-vectors: failed to read the cross-chunk links table for node " +
+            "inspection; a selected object will render disconnected at chunk " +
+            "boundaries. " +
+            (e instanceof Error ? e.message : String(e)),
+        );
+      }
+      this.objectNodesCrossChunkLinks_ = null;
+      return undefined;
+    }
+  }
+
   async getObjectSkeletonNodes(
     objectId: bigint,
     signal: AbortSignal,
@@ -397,6 +458,13 @@ export class ZarrVectorsSpatialGeometrySourceBackend extends WithParameters(
     );
     if (oid === undefined) return [];
 
+    // `implicit_sequential` reconstructs its cross-chunk edges from manifest
+    // block order inside `downloadSegmentSkeleton`, so it needs no table.
+    const crossChunkLinks =
+      linksConvention === "implicit_sequential"
+        ? undefined
+        : await this.getObjectNodesCrossChunkLinks(signal);
+
     const aggregated = await downloadSegmentSkeleton(
       oid,
       {
@@ -408,15 +476,14 @@ export class ZarrVectorsSpatialGeometrySourceBackend extends WithParameters(
         attributeDtypes: attributeDtypes.map(asAttributeDtype),
         linksConvention: linksConvention as ZarrVectorsLinksConvention,
         geometryKind: geometryKind as ZarrVectorsGeometryKind,
-        // Not fetched. `implicit_sequential` reconstructs its cross-chunk
-        // edges from manifest block order instead. For
-        // `implicit_sequential_with_branches` the intra-chunk branch links
-        // arrive with each decoded chunk, so an object living in ONE chunk --
-        // which is what the edit prototype writes -- is complete; an object
-        // spanning several would come back missing the edges BETWEEN chunks,
-        // i.e. as one component per chunk. Fetching the table to fix that is
-        // the whole-level decode this method refuses above.
-        crossChunkLinks: undefined,
+        // See `getObjectNodesCrossChunkLinks`. Previously hardcoded
+        // `undefined`, on the reasoning that fetching the table would mean the
+        // whole-level decode this method refuses above -- but that cost is
+        // specific to `explicit`, which is already refused, so every
+        // convention that reaches here has a table of one record per fragment
+        // adjacency. Passing it is what keeps an object spanning several
+        // chunks from rendering as one disconnected component per chunk.
+        crossChunkLinks,
         hasFragmentSegmentIds,
         chunkCache: this.nodeChunkCache,
       },
