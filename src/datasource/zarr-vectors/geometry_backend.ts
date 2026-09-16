@@ -67,7 +67,10 @@ import {
   type CrossChunkLinksCaches,
   type CrossChunkLinksTable,
 } from "#src/datasource/zarr-vectors/links.js";
-import { objectRank , filterChunkByAdmittedObjects } from "#src/datasource/zarr-vectors/object_budget.js";
+import {
+  objectRank,
+  filterChunkByAdmittedObjects,
+} from "#src/datasource/zarr-vectors/object_budget.js";
 import {
   ShardCellReader,
   type CellReader,
@@ -504,122 +507,6 @@ export class ZarrVectorsSpatialGeometrySourceBackend extends WithParameters(
   private crossChunkLinksReadWarned_ = false;
 
   /**
-   * Filter the cross-chunk-link table down to records incident on the
-   * named chunk.  Output has two kinds of items:
-   *
-   * - `ghostRequests`: cross-chunk records where one endpoint is in
-   *   this chunk and the other is in a different chunk.  Each becomes
-   *   a {@link GhostVertexRequest} so the backend can fetch the
-   *   neighbor's boundary vertex and append it as a ghost.
-   * - `intraChunkEdges`: records where BOTH endpoints are in this
-   *   chunk.  At coarser pyramid levels the writer encodes intra-chunk
-   *   metavertex-to-metavertex bridges (consecutive same-chunk
-   *   fragments of one streamline) here too — no ghost vertex needed
-   *   because both endpoints already live in this chunk's vertex
-   *   texture.  Each record becomes one flat `(a, b)` pair of chunk-
-   *   local vertex indices appended directly to the chunk's edge list.
-   *
-   * Triangle / metanode records (``linkWidth !== 2``) are skipped —
-   * those describe mesh-style face stitching, not line edges.
-   */
-  private buildBridgeRequests(
-    table: CrossChunkLinksTable,
-    selfChunkCoords: Float32Array,
-    selfNumVertices: number,
-  ): {
-    ghostRequests: GhostVertexRequest[];
-    intraChunkEdges: Uint32Array;
-    /**
-     * Intra-chunk bridges resolved to chunk-local predecessor/successor
-     * indices.  Cross-chunk bridges (one endpoint is a future ghost)
-     * are appended later in `download()` once we know each ghost's
-     * chunk-local index — see the comment on the ghost-append step.
-     */
-    intraChunkBridges: ResolvedBridge[];
-    /**
-     * Per-ghost-request side info needed to extend `intraChunkBridges`
-     * after ghosts are appended.  `ghostIsPredecessor[i]` mirrors
-     * `ghostRequests[i].isGhostPredecessor`.
-     */
-    ghostIsPredecessor: boolean[];
-  } {
-    if (table.linkWidth !== 2) {
-      return {
-        ghostRequests: [],
-        intraChunkEdges: new Uint32Array(0),
-        intraChunkBridges: [],
-        ghostIsPredecessor: [],
-      };
-    }
-    const selfCoords = Array.from(selfChunkCoords, (v) => Number(v));
-    const ghostRequests: GhostVertexRequest[] = [];
-    const intraEdges: number[] = [];
-    const intraChunkBridges: ResolvedBridge[] = [];
-    const ghostIsPredecessor: boolean[] = [];
-    for (const record of table.records) {
-      // Cross-chunk records encode walk order: endpoint[0] is the
-      // PREDECESSOR (last vertex of fragment A) and endpoint[1] is
-      // the SUCCESSOR (first vertex of fragment B).  See the polyline
-      // writer at `zarr_vectors/types/polylines.py` and the boundary
-      // helper at `zarr_vectors/spatial/boundary.py:75-114`.
-      //
-      // For cross-chunk records, the ghost's tangent must point in the
-      // forward walk direction.  When this chunk matches endpoint[0],
-      // the ghost is the successor — it sits AFTER the host.  When
-      // this chunk matches endpoint[1], the ghost is the predecessor.
-      // `appendGhostVertices` flips the synthesised ghost-tangent
-      // sign based on `isGhostPredecessor` so both sides of the
-      // bridge interpolate the same forward walk direction.
-      const a = record.endpoints[0];
-      const b = record.endpoints[1];
-      const aMatches = endpointMatchesChunk(a.chunkCoords, selfCoords);
-      const bMatches = endpointMatchesChunk(b.chunkCoords, selfCoords);
-      if (aMatches && bMatches) {
-        // Intra-chunk bridge: writer-emitted record connecting two
-        // fragments inside the SAME chunk (coarser-pyramid-level
-        // metavertex-to-metavertex transition).  Drop the record if
-        // either endpoint is out of range.
-        if (
-          a.vertexIndex < 0 ||
-          a.vertexIndex >= selfNumVertices ||
-          b.vertexIndex < 0 ||
-          b.vertexIndex >= selfNumVertices
-        ) {
-          continue;
-        }
-        intraEdges.push(a.vertexIndex, b.vertexIndex);
-        intraChunkBridges.push({
-          predecessorLocalIdx: a.vertexIndex,
-          successorLocalIdx: b.vertexIndex,
-        });
-      } else if (aMatches) {
-        ghostRequests.push({
-          hostLocalVertex: a.vertexIndex,
-          neighborChunkKey: b.chunkCoords.join("."),
-          neighborLocalVertex: b.vertexIndex,
-          isGhostPredecessor: false, // ghost is endpoint[1] = successor
-        });
-        ghostIsPredecessor.push(false);
-      } else if (bMatches) {
-        ghostRequests.push({
-          hostLocalVertex: b.vertexIndex,
-          neighborChunkKey: a.chunkCoords.join("."),
-          neighborLocalVertex: a.vertexIndex,
-          isGhostPredecessor: true, // ghost is endpoint[0] = predecessor
-        });
-        ghostIsPredecessor.push(true);
-      }
-      // Neither-match records (not ours) are silently ignored.
-    }
-    return {
-      ghostRequests,
-      intraChunkEdges: Uint32Array.from(intraEdges),
-      intraChunkBridges,
-      ghostIsPredecessor,
-    };
-  }
-
-  /**
    * Plan the ghost fetches for a surface chunk's BOUNDARY faces.
    *
    * A face whose corners do not all sit in one chunk is an ordinary record in
@@ -841,11 +728,7 @@ export class ZarrVectorsSpatialGeometrySourceBackend extends WithParameters(
         intraChunkEdges,
         intraChunkBridges,
         ghostIsPredecessor,
-      } = this.buildBridgeRequests(
-        table,
-        chunkGridPosition,
-        decoded.numVertices,
-      );
+      } = buildBridgeRequests(table, chunkGridPosition, decoded.numVertices);
       // Intra-chunk bridges first: both endpoints already live in the
       // chunk's vertex texture, so we just append flat (a, b) pairs to
       // the edges array.  Affects coarser pyramid levels where the
@@ -1050,6 +933,130 @@ function endpointMatchesChunk(
     if (endpointCoords[i] !== selfCoords[i]) return false;
   }
   return true;
+}
+
+/**
+ * Filter the cross-chunk-link table down to records incident on the
+ * named chunk.  Output has two kinds of items:
+ *
+ * - `ghostRequests`: cross-chunk records where one endpoint is in
+ *   this chunk and the other is in a different chunk.  Each becomes
+ *   a {@link GhostVertexRequest} so the backend can fetch the
+ *   neighbor's boundary vertex and append it as a ghost.
+ * - `intraChunkEdges`: records where BOTH endpoints are in this
+ *   chunk.  At coarser pyramid levels the writer encodes intra-chunk
+ *   metavertex-to-metavertex bridges (consecutive same-chunk
+ *   fragments of one streamline) here too — no ghost vertex needed
+ *   because both endpoints already live in this chunk's vertex
+ *   texture.  Each record becomes one flat `(a, b)` pair of chunk-
+ *   local vertex indices appended directly to the chunk's edge list.
+ *
+ * Triangle / metanode records (``linkWidth !== 2``) are skipped —
+ * those describe mesh-style face stitching, not line edges.
+ *
+ * Module-level and exported rather than a method on
+ * {@link ZarrVectorsSpatialGeometrySourceBackend}: it touches no instance
+ * state, and pass-1's cross-chunk continuity is only verifiable end-to-end by
+ * driving this together with `downloadGeometryChunk`,
+ * `readCrossChunkLinksForChunk` and `appendGhostVertices` over real store
+ * bytes.  Keeping it private forced such a harness to re-implement it, which
+ * is precisely the copy that would stop reflecting this code.
+ */
+export function buildBridgeRequests(
+  table: CrossChunkLinksTable,
+  selfChunkCoords: Float32Array | readonly number[],
+  selfNumVertices: number,
+): {
+  ghostRequests: GhostVertexRequest[];
+  intraChunkEdges: Uint32Array;
+  /**
+   * Intra-chunk bridges resolved to chunk-local predecessor/successor
+   * indices.  Cross-chunk bridges (one endpoint is a future ghost)
+   * are appended later in `download()` once we know each ghost's
+   * chunk-local index — see the comment on the ghost-append step.
+   */
+  intraChunkBridges: ResolvedBridge[];
+  /**
+   * Per-ghost-request side info needed to extend `intraChunkBridges`
+   * after ghosts are appended.  `ghostIsPredecessor[i]` mirrors
+   * `ghostRequests[i].isGhostPredecessor`.
+   */
+  ghostIsPredecessor: boolean[];
+} {
+  if (table.linkWidth !== 2) {
+    return {
+      ghostRequests: [],
+      intraChunkEdges: new Uint32Array(0),
+      intraChunkBridges: [],
+      ghostIsPredecessor: [],
+    };
+  }
+  const selfCoords = Array.from(selfChunkCoords, (v) => Number(v));
+  const ghostRequests: GhostVertexRequest[] = [];
+  const intraEdges: number[] = [];
+  const intraChunkBridges: ResolvedBridge[] = [];
+  const ghostIsPredecessor: boolean[] = [];
+  for (const record of table.records) {
+    // Cross-chunk records encode walk order: endpoint[0] is the
+    // PREDECESSOR (last vertex of fragment A) and endpoint[1] is
+    // the SUCCESSOR (first vertex of fragment B).  See the polyline
+    // writer at `zarr_vectors/types/polylines.py` and the boundary
+    // helper at `zarr_vectors/spatial/boundary.py:75-114`.
+    //
+    // For cross-chunk records, the ghost's tangent must point in the
+    // forward walk direction.  When this chunk matches endpoint[0],
+    // the ghost is the successor — it sits AFTER the host.  When
+    // this chunk matches endpoint[1], the ghost is the predecessor.
+    // `appendGhostVertices` flips the synthesised ghost-tangent
+    // sign based on `isGhostPredecessor` so both sides of the
+    // bridge interpolate the same forward walk direction.
+    const a = record.endpoints[0];
+    const b = record.endpoints[1];
+    const aMatches = endpointMatchesChunk(a.chunkCoords, selfCoords);
+    const bMatches = endpointMatchesChunk(b.chunkCoords, selfCoords);
+    if (aMatches && bMatches) {
+      // Intra-chunk bridge: writer-emitted record connecting two
+      // fragments inside the SAME chunk (coarser-pyramid-level
+      // metavertex-to-metavertex transition).  Drop the record if
+      // either endpoint is out of range.
+      if (
+        a.vertexIndex < 0 ||
+        a.vertexIndex >= selfNumVertices ||
+        b.vertexIndex < 0 ||
+        b.vertexIndex >= selfNumVertices
+      ) {
+        continue;
+      }
+      intraEdges.push(a.vertexIndex, b.vertexIndex);
+      intraChunkBridges.push({
+        predecessorLocalIdx: a.vertexIndex,
+        successorLocalIdx: b.vertexIndex,
+      });
+    } else if (aMatches) {
+      ghostRequests.push({
+        hostLocalVertex: a.vertexIndex,
+        neighborChunkKey: b.chunkCoords.join("."),
+        neighborLocalVertex: b.vertexIndex,
+        isGhostPredecessor: false, // ghost is endpoint[1] = successor
+      });
+      ghostIsPredecessor.push(false);
+    } else if (bMatches) {
+      ghostRequests.push({
+        hostLocalVertex: b.vertexIndex,
+        neighborChunkKey: a.chunkCoords.join("."),
+        neighborLocalVertex: a.vertexIndex,
+        isGhostPredecessor: true, // ghost is endpoint[0] = predecessor
+      });
+      ghostIsPredecessor.push(true);
+    }
+    // Neither-match records (not ours) are silently ignored.
+  }
+  return {
+    ghostRequests,
+    intraChunkEdges: Uint32Array.from(intraEdges),
+    intraChunkBridges,
+    ghostIsPredecessor,
+  };
 }
 
 /**
