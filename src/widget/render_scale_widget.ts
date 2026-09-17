@@ -121,11 +121,16 @@ export class RenderScaleWidget extends RefCounted {
       return;
     }
     this.hoverTarget.value = undefined;
-    const logScaleMax = Math.round(
-      this.logScaleOrigin + numRenderScaleHistogramBins * this.logScaleBinSize,
-    );
+    // The top of the axis actually drawn, not `Math.round(...) - 1` -- that
+    // fixed one-octave haircut assumed the default `logScaleBinSize` (0.5),
+    // where the axis spans 20 octaves and giving up one is unnoticeable. A
+    // per-pyramid histogram (`SpatialSkeletonGridRenderScaleWidget`) can have
+    // a `binSize` two orders of magnitude smaller, so the same haircut ate
+    // nearly half the axis and made the coarsest level unreachable by wheel.
+    const logScaleMax =
+      this.logScaleOrigin + numRenderScaleHistogramBins * this.logScaleBinSize;
     const targetValue = clampToInterval(
-      [2 ** this.logScaleOrigin, 2 ** (logScaleMax - 1)],
+      [2 ** this.logScaleOrigin, 2 ** logScaleMax],
       this.target.value * 2 ** Math.sign(deltaY),
     ) as number;
     this.target.value = targetValue;
