@@ -2224,6 +2224,12 @@ async function buildGeometryMetadata(
       // See `findClosestSpatialSkeletonGridLevelBySpacing` in
       // `src/layer/segmentation/index.ts:588-603` for the picker that
       // then looks up sources by `gridIndex`.
+      //
+      // NOTE for anyone reading `spatialSkeletonGridLevel3d`/`2d` off a saved
+      // state or URL: this inversion means that value is NOT the store's own
+      // level directory number. A 3-level store (paths "0", "1", "2") with
+      // `spatialSkeletonGridLevel3d === 2` is drawing the store's "0" (the
+      // finest level, gridIndex numLevels-1), not its "2".
       params.gridIndex = levelPaths.length - 1 - k;
       params.hasFragmentSegmentIds = perLevelMeta[k].hasFragmentSegmentIds;
       params.vertexIdAttribute = vertexIdAttribute;
