@@ -805,20 +805,40 @@ export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
   if (!Number.isFinite(pixelSize) || pixelSize <= 0) return;
   // Camera-only target (no user bias yet).
   //
-  // Prefer a MEMORY-derived target where the layer can supply one. The
-  // pixel-derived figure below is the right answer for a pyramid whose levels
-  // differ in resolution, but for one whose levels differ in how many whole
-  // objects they hold it saturates: `pixelSize * CUTOFF` is already at or below
-  // the finest level's spacing at a whole-volume view and only falls further as
-  // you zoom in, so the level it selects never changes over the entire useful
-  // range. What does vary usefully is how many cells the view covers — see
-  // `targetSpacingForCellBudget`.
+  // Combine the pixel- and memory-derived targets rather than letting one
+  // replace the other. The pixel-derived figure is the right DETAIL question
+  // for a pyramid whose levels differ in resolution — it is what lets the
+  // camera drive the level at all. The memory-derived figure is the right
+  // ADMISSIBILITY question for a pyramid whose levels differ in how many
+  // whole objects they hold: `pixelSize * CUTOFF` alone saturates there
+  // (already at or below the finest level's spacing at a whole-volume view,
+  // and only falls further as you zoom in, so the level it selects never
+  // changes over the entire useful range — the bug `targetSpacingForCellBudget`
+  // was written to fix).
+  //
+  // Larger target -> a coarser level is picked (see
+  // `findClosestSpatialSkeletonGridLevelBySpacing`), and `memoryTarget` is
+  // "the finest spacing that still fits `visibleCellCount` cells in budget",
+  // or the coarsest available spacing when nothing fits. So the correct
+  // combinator is a MAX, applied whenever a memory target exists: it never
+  // asks for a level FINER than the budget allows (nothing changes for a
+  // sparsity pyramid near or over budget, e.g. the whole-brain tractogram
+  // `targetSpacingForCellBudget` exists for — `memoryTarget` there is already
+  // large and dominates), while for a pyramid that fits easily at every zoom
+  // (a resolution pyramid on a small object, e.g. `object_sparsity: 1.0`
+  // throughout) `memoryTarget` is small — at most the finest level's own
+  // spacing — so the pixel-derived figure dominates instead and the camera
+  // is free to drive the level. No pyramid-kind classification needed: the
+  // bound is mathematically safe either way, not merely typical-case safe.
   const memoryTarget =
     visibleCellCount === undefined
       ? undefined
       : memoryAwareSpacingTarget(displayState, visibleCellCount);
+  const pixelDriven = pixelSize * AUTO_SPATIAL_SKELETON_GRID_DETAIL_CUTOFF;
   const autoUnbiased =
-    memoryTarget ?? pixelSize * AUTO_SPATIAL_SKELETON_GRID_DETAIL_CUTOFF;
+    memoryTarget === undefined
+      ? pixelDriven
+      : Math.max(pixelDriven, memoryTarget);
 
   // The multiplicative detail `bias` (set when the user clicks/drags the
   // widget) lives in the *persistent* displayState so the calibration

@@ -398,3 +398,112 @@ describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget bias stability", ()
     expect(target.value).toBeCloseTo(0.2, 10);
   });
 });
+
+describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget memory-target combination", () => {
+  function makeWatchable<T>(initial: T) {
+    let v = initial;
+    return {
+      get value() {
+        return v;
+      },
+      set value(x: T) {
+        v = x;
+      },
+      changed: { dispatch: () => {} },
+    };
+  }
+
+  // Identity view-projection + width 1000 => pixelSize 0.001 => the
+  // pixel-derived target is always 0.001 * 200 = 0.2 (see the bias-stability
+  // suite above, which pins this same calibration).
+  const viewProjectionMat = mat4.create();
+  const localPosition = new Float32Array(0);
+  const projectionParameters = {
+    viewProjectionMat,
+    width: 1000,
+    height: 1,
+    globalPosition: new Float32Array(3),
+  };
+  const PIXEL_DRIVEN_TARGET = 0.2;
+
+  // Coarsest-first, matching `spatialSkeletonGridLevels` / per-cell-cost
+  // convention: level 0 spacing 0.5 (coarse), level 1 spacing 0.1 (fine).
+  const levels = [
+    { size: { x: 0.5, y: 0.5, z: 0.5 }, lod: 0 },
+    { size: { x: 0.1, y: 0.1, z: 0.1 }, lod: 1 },
+  ];
+
+  it("lets the camera drive the level when the whole pyramid easily fits in budget (a resolution pyramid)", () => {
+    const target = makeWatchable(0);
+    const displayState = {
+      autoSpatialSkeletonGridLevel3d: { value: true },
+      spatialSkeletonGridResolutionTarget3d: target,
+      // Both levels cost far less than the budget: unconstrained.
+      spatialSkeletonPerCellCostBytes: makeWatchable([100, 100]),
+      spatialSkeletonGpuBudgetBytes: makeWatchable(1e9),
+      spatialSkeletonGridLevels: makeWatchable(levels),
+    } as any;
+
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      projectionParameters,
+      localPosition,
+      "3d",
+      /* visibleCellCount= */ 1,
+    );
+
+    // Before this fix, the memory target (the finest affordable spacing,
+    // 0.1) unconditionally REPLACED the pixel-derived one, so the level
+    // never changed no matter how far the camera zoomed. It must now be
+    // the pixel-derived value driving the target -- larger than the
+    // memory floor here, so the max() correctly picks it.
+    expect(target.value).toBeCloseTo(PIXEL_DRIVEN_TARGET, 10);
+  });
+
+  it("still floors the target at the finest AFFORDABLE level when the budget is tight (a whole-brain sparsity pyramid)", () => {
+    const target = makeWatchable(0);
+    const displayState = {
+      autoSpatialSkeletonGridLevel3d: { value: true },
+      spatialSkeletonGridResolutionTarget3d: target,
+      // Both levels cost far more than the budget: nothing fits, so
+      // `targetSpacingForCellBudget` falls back to the coarsest level's
+      // own spacing (0.5) -- the exact case commit 4c688c1c protects.
+      spatialSkeletonPerCellCostBytes: makeWatchable([1e12, 1e12]),
+      spatialSkeletonGpuBudgetBytes: makeWatchable(1e9),
+      spatialSkeletonGridLevels: makeWatchable(levels),
+    } as any;
+
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      projectionParameters,
+      localPosition,
+      "3d",
+      /* visibleCellCount= */ 1,
+    );
+
+    // The memory floor (0.5) is coarser than the pixel-derived target
+    // (0.2), so it must dominate -- identical to the pre-fix behaviour
+    // for a pyramid that cannot fit, regardless of the max() change.
+    expect(target.value).toBeCloseTo(0.5, 10);
+  });
+
+  it("keeps the pure pixel-derived target when the layer publishes no per-cell costs", () => {
+    const target = makeWatchable(0);
+    const displayState = {
+      autoSpatialSkeletonGridLevel3d: { value: true },
+      spatialSkeletonGridResolutionTarget3d: target,
+      // No spatialSkeletonPerCellCostBytes / GpuBudgetBytes / GridLevels at
+      // all -- every non-tract spatially-indexed skeleton layer today.
+    } as any;
+
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      projectionParameters,
+      localPosition,
+      "3d",
+      /* visibleCellCount= */ 1,
+    );
+
+    expect(target.value).toBeCloseTo(PIXEL_DRIVEN_TARGET, 10);
+  });
+});
