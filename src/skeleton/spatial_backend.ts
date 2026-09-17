@@ -164,7 +164,15 @@ const MAX_ROI_REGION_CHUNKS = 512;
 const ROI_REGION_CHUNK_PRIORITY = 10;
 
 function getChunkSpacing(size: Float32Array): number {
-  return Math.max(Math.min(size[0], size[1], size[2]), 1e-6);
+  // The floor guards only against a literal zero/degenerate chunk size
+  // (-> log2(0) === -Infinity downstream), not a claim that no real spacing
+  // is smaller than this. `1e-6` (1 micron) reads as generous for a
+  // whole-brain EM volume but silently clamps any skeleton/streamline
+  // pyramid finer than that -- e.g. a 40 nm chunk shape (4e-8 m) always
+  // floors to exactly 1e-6, so every level of such a pyramid reports the
+  // identical spacing and the resolution histogram collapses to one
+  // permanently pinned bar regardless of which level is actually active.
+  return Math.max(Math.min(size[0], size[1], size[2]), 1e-30);
 }
 
 /**

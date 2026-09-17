@@ -66,7 +66,13 @@ export function getSpatialSkeletonGridHistogramConfig(
   let minLogSpacing = Number.POSITIVE_INFINITY;
   let maxLogSpacing = Number.NEGATIVE_INFINITY;
   for (const level of levels) {
-    const spacing = Math.max(getSpatialSkeletonGridSpacing(level.size), 1e-6);
+    // Degenerate-input guard (avoids log2(0) === -Infinity below), not a
+    // physical minimum -- 1e-6 (1 micron) silently floored every level of a
+    // sub-micron skeleton/streamline pyramid to the same spacing, which
+    // reads here as zero spread ("a single level ... no meaningful
+    // spread") and permanently pins the histogram/marker at 1 micron,
+    // however many genuinely distinct (sub-micron) levels actually exist.
+    const spacing = Math.max(getSpatialSkeletonGridSpacing(level.size), 1e-30);
     const logSpacing = Math.log2(spacing);
     logSpacings.push(logSpacing);
     minLogSpacing = Math.min(minLogSpacing, logSpacing);

@@ -1936,7 +1936,11 @@ export class SpatiallyIndexedSkeletonLayer
 
   private getChunkSpacing(chunkLayout: ChunkLayout): number {
     const { size } = chunkLayout;
-    return Math.max(Math.min(size[0], size[1], size[2]), 1e-6);
+    // See the matching comment on `getChunkSpacing` in spatial_backend.ts:
+    // this is a degenerate-input guard, not a physical minimum -- 1e-6
+    // (1 micron) silently collapsed every level of a sub-micron
+    // skeleton/streamline pyramid to the same reported spacing.
+    return Math.max(Math.min(size[0], size[1], size[2]), 1e-30);
   }
 
   private getChunkCenterWorld(
@@ -2495,8 +2499,10 @@ export class SpatiallyIndexedSkeletonLayer
   ) {
     histogram.begin(frameNumber);
     if (lod === undefined || transformedSources.length === 0) return;
+    // Degenerate-input guard, not a physical minimum -- see the matching
+    // comment on `getChunkSpacing` in spatial_backend.ts.
     const spacingOf = (size: { x: number; y: number; z: number }) =>
-      Math.max(Math.min(size.x, size.y, size.z), 1e-6);
+      Math.max(Math.min(size.x, size.y, size.z), 1e-30);
     const perSpacing = new Map<number, { present: number; missing: number }>();
     this.forEachVisibleChunkSlot(
       view,
