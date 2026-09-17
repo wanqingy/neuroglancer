@@ -2245,10 +2245,32 @@ export class SpatiallyIndexedSkeletonLayer
     // a cell near the camera resolves finer than one far from it. OBJECT focus
     // opts out: it draws ONE level everywhere and spends the memory that leaves
     // on whole objects, which scattering levels across the view would undo.
+    //
+    // ...and it needs the SAME precondition as the OBJECT-focus union above,
+    // for the same reason. This loop enumerates cells on one anchor level's
+    // grid but emits a WHOLE CHUNK of whichever level each cell chose, and the
+    // only de-duplication is per (source, chunkKey) -- nothing excludes
+    // overlapping chunks drawn from different levels. Where a coarser chunk
+    // covers many anchor cells (a 160nm chunk spans 4^3 = 64 40nm cells), one
+    // cell resolving coarse while its neighbours resolve fine emits both, and
+    // every object in the overlap is drawn twice, at two densities. That is
+    // only harmless when the levels hold DISJOINT objects, which is exactly
+    // what `objectPartitionAvailable` reports; on a resolution pyramid every
+    // level holds every object, so the overlap is a visible double-draw.
+    //
+    // Requiring the partition here confines arbitration to pyramids where
+    // overlap cannot double-draw, and lets a resolution pyramid fall through
+    // to the single-level path below -- so the camera-derived grid level
+    // actually decides what is drawn, and zoom switches level. Repairing
+    // arbitration's coverage (an octree descent, or suppressing every anchor
+    // cell a selected chunk covers) would lift this restriction and also fix
+    // the converse defect: a finer-than-anchor pick emits only the chunk at
+    // the cell centre and silently drops its siblings.
     if (
       view === "3d" &&
       this.detailFocus.value === SpatialSkeletonDetailFocus.LOCAL &&
-      selectedSources.length > 1
+      selectedSources.length > 1 &&
+      this.objectPartitionAvailable(view)
     ) {
       const transformedBySourceId = new Map<string, TransformedSource>();
       for (const scales of transformedSources) {

@@ -16,9 +16,23 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import { SpatialSkeletonDetailFocus } from "#src/skeleton/spatial_chunk_sizing.js";
+import type * as SliceViewBase from "#src/sliceview/base.js";
 import { Uint64Set } from "#src/uint64_set.js";
 import { DataType } from "#src/util/data_type.js";
 import { mat4 } from "#src/util/geom.js";
+
+// `forEachVisibleChunkSlot`'s per-cell arbitration branch calls this to walk
+// the anchor level's visible cells; its real implementation needs a fully
+// realized projection matrix and chunk layout. The arbitration-gating tests
+// below only need to observe whether the branch is ENTERED (a spy on an
+// internal method call already proves that), not what it enumerates, so the
+// callback itself is left a no-op here -- everything else from the module
+// stays real.
+vi.mock("#src/sliceview/base.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof SliceViewBase>();
+  return { ...actual, forEachVisibleVolumetricChunk: vi.fn() };
+});
 
 if (!("WebGL2RenderingContext" in globalThis)) {
   Object.defineProperty(globalThis, "WebGL2RenderingContext", {
@@ -505,5 +519,91 @@ describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget memory-target combi
     );
 
     expect(target.value).toBeCloseTo(PIXEL_DRIVEN_TARGET, 10);
+  });
+});
+
+describe("forEachVisibleChunkSlot LOCAL-focus arbitration gating", () => {
+  // Two candidate levels with distinct chunkSource identities, standing in
+  // for a 3-level resolution pyramid's finest and coarsest levels.
+  function makeLevels() {
+    const chunkSourceFine = { name: "fine" };
+    const chunkSourceCoarse = { name: "coarse" };
+    const selectedSources = [
+      { chunkSource: chunkSourceFine },
+      { chunkSource: chunkSourceCoarse },
+    ];
+    const transformedSources = [
+      [
+        { source: chunkSourceFine, chunkLayout: {} },
+        { source: chunkSourceCoarse, chunkLayout: {} },
+      ],
+    ];
+    return {
+      chunkSourceFine,
+      chunkSourceCoarse,
+      selectedSources,
+      transformedSources,
+    };
+  }
+
+  function makeFakeLayer(partitioned: boolean, selectedSources: unknown[]) {
+    return {
+      detailFocus: { value: SpatialSkeletonDetailFocus.LOCAL },
+      localPosition: { value: new Float32Array(3) },
+      objectPartitionAvailable: vi.fn(() => partitioned),
+      getSources: vi.fn(() => []),
+      selectSourcesForViewAndGrid: vi.fn(() => selectedSources),
+      selectSourcesForViewAndGridWithFallback: vi.fn(() => selectedSources),
+      getChunkSpacing: vi.fn(() => 1),
+      getMetersPerUnit: vi.fn(() => 1),
+      getLevelSpacingsMeters: vi.fn(() => [4e-8, 1.6e-7]),
+      getArbitrationTargetSpacingMeters3d: vi.fn(() => 8e-8),
+      getReferencePixelSize: vi.fn(() => 1),
+      getChunkCenterWorld: vi.fn(),
+      getChunkGridPositionForWorldPoint: vi.fn(() => false),
+      quantizeSpacingForArbitration: vi.fn((s: number) => s),
+    };
+  }
+
+  it("skips per-cell arbitration when the levels do not partition objects", () => {
+    const { selectedSources, transformedSources } = makeLevels();
+    const layer = makeFakeLayer(/* partitioned= */ false, selectedSources);
+
+    (
+      SpatiallyIndexedSkeletonLayer.prototype as any
+    ).forEachVisibleChunkSlot.call(
+      layer,
+      "3d",
+      /* gridLevel= */ 0,
+      transformedSources,
+      {} as any,
+      () => {},
+    );
+
+    expect(layer.objectPartitionAvailable).toHaveBeenCalledWith("3d");
+    // The gate must short-circuit before any arbitration-only internals run
+    // -- this is the exact condition the fix added.
+    expect(layer.getArbitrationTargetSpacingMeters3d).not.toHaveBeenCalled();
+    expect(layer.getLevelSpacingsMeters).not.toHaveBeenCalled();
+  });
+
+  it("still runs per-cell arbitration when the levels do partition objects", () => {
+    const { selectedSources, transformedSources } = makeLevels();
+    const layer = makeFakeLayer(/* partitioned= */ true, selectedSources);
+
+    (
+      SpatiallyIndexedSkeletonLayer.prototype as any
+    ).forEachVisibleChunkSlot.call(
+      layer,
+      "3d",
+      /* gridLevel= */ 0,
+      transformedSources,
+      {} as any,
+      () => {},
+    );
+
+    expect(layer.objectPartitionAvailable).toHaveBeenCalledWith("3d");
+    expect(layer.getArbitrationTargetSpacingMeters3d).toHaveBeenCalled();
+    expect(layer.getLevelSpacingsMeters).toHaveBeenCalled();
   });
 });
