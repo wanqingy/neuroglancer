@@ -411,6 +411,72 @@ describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget bias stability", ()
     expect(bias.value).toBe(1);
     expect(target.value).toBeCloseTo(0.2, 10);
   });
+
+  it("does not read a reset's hard-default target as a deliberate recalibration", () => {
+    // The only path that flips `autoSpatialSkeletonGridLevel3d` false->true is
+    // `reset()` on the widget (a double-click), which sets it immediately
+    // before `target.reset()` writes the class's hard default (1 metre).
+    // Before the fix, the huge gap between that default and the last real
+    // auto value was read as "the user just deliberately recalibrated",
+    // baking an enormous multiplier into the persisted `bias` and pinning
+    // the level at the coarsest available level forever.
+    const target = makeWatchable(0);
+    const bias = makeWatchable(1);
+    const displayState = {
+      autoSpatialSkeletonGridLevel3d: { value: true },
+      spatialSkeletonGridResolutionTarget3d: target,
+      spatialSkeletonGridResolutionBias3d: bias,
+    } as any;
+    const viewProjectionMat = mat4.create();
+    const localPosition = new Float32Array(0);
+    const projectionParameters = {
+      viewProjectionMat,
+      width: 1000,
+      height: 1,
+      globalPosition: new Float32Array(3),
+    };
+
+    // A real auto session: establishes `lastAuto` at the pixel-driven target.
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      projectionParameters,
+      localPosition,
+      "3d",
+    );
+    expect(target.value).toBeCloseTo(0.2, 10);
+
+    // A manual click: disables auto and jumps the target away (simulating
+    // the widget's own "set" handler + `onManualTarget`).
+    displayState.autoSpatialSkeletonGridLevel3d.value = false;
+    target.value = 5;
+    // While auto is off the function is still called every frame (the
+    // caller does not gate on the flag) but must not touch `target`/`bias`.
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      projectionParameters,
+      localPosition,
+      "3d",
+    );
+    expect(target.value).toBe(5);
+    expect(bias.value).toBe(1);
+
+    // A double-click reset: `onResetTarget` re-enables auto, then
+    // `target.reset()` writes the class's hard default (1).
+    displayState.autoSpatialSkeletonGridLevel3d.value = true;
+    target.value = 1;
+
+    maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
+      displayState,
+      projectionParameters,
+      localPosition,
+      "3d",
+    );
+
+    // Must snap straight back to the camera-derived value, not stay pinned
+    // near the hard default, and must not corrupt the persisted bias.
+    expect(target.value).toBeCloseTo(0.2, 10);
+    expect(bias.value).toBe(1);
+  });
 });
 
 describe("maybeUpdateAutoSpatialSkeletonGridResolutionTarget memory-target combination", () => {

@@ -774,12 +774,32 @@ export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
     view === "3d"
       ? displayState.autoSpatialSkeletonGridLevel3d
       : displayState.autoSpatialSkeletonGridLevel2d;
-  if (autoFlag === undefined || autoFlag.value !== true) return;
   const target =
     view === "3d"
       ? displayState.spatialSkeletonGridResolutionTarget3d
       : displayState.spatialSkeletonGridResolutionTarget2d;
-  if (target === undefined) return;
+  const isAutoOn = autoFlag !== undefined && autoFlag.value === true;
+  // Track auto on/off transitions even on frames we are about to bail out of
+  // below -- this function runs every frame regardless of the flag, and the
+  // ONLY path that flips it false->true is `reset()` on the widget (a
+  // double-click), which sets it immediately before `target.reset()` runs.
+  // So the very next time this sees `isAutoOn`, `target.value` is always the
+  // class's hard default, never a deliberate recalibration -- reading the gap
+  // to the last real auto value as drift (below) would bake a many-orders-of-
+  // magnitude bias into the PERSISTED calibration and pin the level at the
+  // coarsest available forever. Clearing `lastAuto` here makes this frame
+  // establish a fresh baseline instead.
+  if (target !== undefined) {
+    let st = autoSpatialSkeletonBias.get(target);
+    if (st === undefined) {
+      st = { lastAuto: undefined, wasAutoOn: isAutoOn };
+      autoSpatialSkeletonBias.set(target, st);
+    } else if (isAutoOn && !st.wasAutoOn) {
+      st.lastAuto = undefined;
+    }
+    st.wasAutoOn = isAutoOn;
+  }
+  if (!isAutoOn || target === undefined) return;
   // Pick the first non-empty reference position.  GlobalPosition is
   // populated for all 3D-view renders even when the segmentation
   // layer has no layer-local dimensions (the common case, where
@@ -852,11 +872,10 @@ export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
     view === "3d"
       ? displayState.spatialSkeletonGridResolutionBias3d
       : displayState.spatialSkeletonGridResolutionBias2d;
-  let st = autoSpatialSkeletonBias.get(target);
-  if (st === undefined) {
-    st = { lastAuto: undefined };
-    autoSpatialSkeletonBias.set(target, st);
-  }
+  // Always set by the transition bookkeeping above, which runs whenever
+  // `target !== undefined` -- true here, since we would have returned above
+  // otherwise.
+  const st = autoSpatialSkeletonBias.get(target)!;
   let bias =
     biasWatchable !== undefined &&
     Number.isFinite(biasWatchable.value) &&
@@ -912,13 +931,16 @@ export function maybeUpdateAutoSpatialSkeletonGridResolutionTarget(
 }
 
 // Transient per-resolution-target auto-LOD state: the last auto-written
-// target value, used to detect manual widget interaction frame-to-frame.
-// The persistent detail `bias` lives in displayState (see
+// target value, used to detect manual widget interaction frame-to-frame, and
+// whether auto was on as of the last call (to detect an off->on transition
+// even on frames the caller bails out on -- see
+// `maybeUpdateAutoSpatialSkeletonGridResolutionTarget`). The persistent
+// detail `bias` lives in displayState (see
 // `spatialSkeletonGridResolutionBias{2d,3d}`), not here.  Keyed weakly by
 // the target.
 const autoSpatialSkeletonBias = new WeakMap<
   WatchableValueInterface<number>,
-  { lastAuto: number | undefined }
+  { lastAuto: number | undefined; wasAutoOn: boolean }
 >();
 
 export interface SpatiallyIndexedSkeletonLayerDisplayState

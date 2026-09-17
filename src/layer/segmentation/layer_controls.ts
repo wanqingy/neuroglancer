@@ -179,6 +179,11 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
         // automatic level selection for the rest of the session.
         onResetTarget: () => {
           layer.displayState.autoSpatialSkeletonGridLevel2d.value = true;
+          // Restore the default calibration too. Without this, a bias baked
+          // in before a fix to the auto-resume path (or by any future bug in
+          // it) survives every future reset -- a double-click should return
+          // to pure camera-driven behaviour, not to a stale multiplier.
+          layer.displayState.spatialSkeletonGridResolutionBias2d.reset();
         },
       }),
       SpatialSkeletonGridRenderScaleWidget,
@@ -215,6 +220,11 @@ export const LAYER_CONTROLS: LayerControlDefinition<SegmentationUserLayer>[] = [
         // automatic level selection for the rest of the session.
         onResetTarget: () => {
           layer.displayState.autoSpatialSkeletonGridLevel3d.value = true;
+          // Restore the default calibration too. Without this, a bias baked
+          // in before a fix to the auto-resume path (or by any future bug in
+          // it) survives every future reset -- a double-click should return
+          // to pure camera-driven behaviour, not to a stale multiplier.
+          layer.displayState.spatialSkeletonGridResolutionBias3d.reset();
         },
       }),
       SpatialSkeletonGridRenderScaleWidget,
